@@ -1,0 +1,109 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+      with:
+        fetch-depth: 0
+        path: electron-chrome-extensions
+    - name: Build
+      shell: bash
+      run: |
+        cd electron-chrome-extensions
+        
+        # Configure git to be more predictable and deterministic
+        git config core.autocrlf false
+        git config core.ignorecase false
+        git config core.fscache true
+        git config core.longpaths true
+        git config diff.renameLimit 0
+        git config status.renameLimit 0
+        git config merge.renameLimit 0
+        git config http.lowSpeedLimit 0
+        git config http.lowSpeedTime 300
+        git config http.postBuffer 1048576000
+        git config pack.threads 1
+        git config index.threads 0
+        
+        # Check electron-chrome-extensions version on npm
+        export electron_chrome_extensions_version=$(curl -sS 'https://registry.npmjs.org/electron-chrome-extensions' | python -c "import sys, json; print(json.load(sys.stdin)['dist-tags']['latest'])")
+        if [ -f "package.json" ] && [ $electron_chrome_extensions_version == $(cat package.json | python -c "import sys, json; print(json.load(sys.stdin)['version'])") ]; then
+          exit 0
+        fi
+        
+        # Roll back the repository
+        git reset --hard $(git rev-list --max-parents=0 HEAD)
+        git clean -dffx
+        
+        # Install using npm 6
+        # Later versions fail to create a sane dependency tree in some situations
+        export npm_version=$(curl -sS 'https://registry.npmjs.org/npm' | python -c "import sys, json; print(json.load(sys.stdin)['dist-tags']['latest-6'])")
+        curl -sSo "npm-$npm_version.tgz" "https://registry.npmjs.org/npm/-/npm-$npm_version.tgz"
+        mkdir -p "bin/npm"
+        tar -xzf "npm-$npm_version.tgz" --strip-components=1 -C "bin/npm"
+        rm "npm-$npm_version.tgz"
+        
+        # Initialize dummy package
+        node bin/npm/bin/npm-cli.js init -y
+        sed -i 's/"name": "electron-chrome-extensions"/"name": "npm"/' -- 'package.json'
+        
+        # Install electron-chrome-extensions as a dependency
+        node bin/npm/bin/npm-cli.js install --no-audit --no-bin-links --no-fund --ignore-scripts --no-optional "electron-chrome-extensions@$electron_chrome_extensions_version"
+        
+        # Remove npm
+        rm -r bin/
+        rm package.json
+        rm package-lock.json
+        
+        # Modify package.json to match the electron-chrome-extensions tarball from npm
+        cat << 'EOF' > script.js
+        const fs = require('fs')
+        const pkg = require('./node_modules/electron-chrome-extensions/package.json')
+        const obj = {}
+        if(pkg.author.name === 'Samuel Maddock' && pkg.author.email === 'sam@samuelmaddock.com') pkg.author = 'Samuel Maddock <sam@samuelmaddock.com>'
+        if(pkg.repository.type === 'git' && pkg.repository.url === 'git+https://github.com/samuelmaddock/electron-browser-shell.git') pkg.repository = 'https://github.com/samuelmaddock/electron-browser-shell'
+        if(pkg.license === 'SEE LICENSE IN LICENSE.md') pkg.license = 'GPL-3.0'
+        obj.name = pkg.name
+        obj.version = pkg.version
+        obj.description = pkg.description
+        obj.main = pkg.main
+        obj.module = pkg.module
+        obj.types = pkg.types
+        obj.exports = pkg.exports
+        obj.scripts = pkg.scripts
+        obj.keywords = pkg.keywords
+        obj.repository = pkg.repository
+        obj.author = pkg.author
+        obj.license = pkg.license
+        obj.dependencies = pkg.dependencies
+        obj.devDependencies = pkg.devDependencies
+        if(Object.keys(pkg.peerDependencies).length > 0) obj.peerDependencies = pkg.peerDependencies
+        fs.writeFileSync('./node_modules/electron-chrome-extensions/package.json', JSON.stringify(obj, null, 2) + '\n', 'utf-8')
+        EOF
+        node --use_strict script.js
+        rm script.js
+        
+        # https://github.com/samuelmaddock/electron-browser-shell/issues/158
+        sed -i -z 's/managed: local/\/\/managed: local/' -- 'node_modules/electron-chrome-extensions/dist/chrome-extension-api.preload.js'
+        sed -i -z 's/sync: local/\/\/sync: local/' -- 'node_modules/electron-chrome-extensions/dist/chrome-extension-api.preload.js'
+        
+        # Add electron-chrome-extensions to the repository
+        rm -rf node_modules/electron-chrome-extensions/node_modules/
+        cp -r node_modules/electron-chrome-extensions ..
+        rm -r node_modules/
+        
+        # Push to GitHub
+        git add -f .
+        git -c user.name="GitHub" -c user.email="noreply@github.com" commit --author="github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>" -m"$electron_chrome_extensions_version" | sed -n 1p
+        git tag -f "$electron_chrome_extensions_version"
+        git push --force
+        git push -f origin "refs/tags/$electron_chrome_extensions_version:refs/tags/$electron_chrome_extensions_version"
